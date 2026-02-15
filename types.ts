@@ -17,6 +17,8 @@ export interface Outfit {
   generatedImageUrl: string; // The AI generated model look
   description: string;
   createdAt: number;
+  isFavorite?: boolean; // New: Favorite status
+  rating?: number; // New: User rating (0-5)
 }
 
 export interface UserProfile {
@@ -39,4 +41,11 @@ export interface ChatMessage {
   isAudioPlaying?: boolean;
 }
 
-export type ViewState = 'wardrobe' | 'chat' | 'profile' | 'outfits';
+export interface ChatSession {
+  id: string;
+  title: string;
+  messages: ChatMessage[];
+  updatedAt: number;
+}
+
+export type ViewState = 'wardrobe' | 'profile' | 'outfits';

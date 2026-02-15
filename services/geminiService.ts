@@ -10,102 +10,145 @@ const EDIT_MODEL = "gemini-2.5-flash-image";
 const TTS_MODEL = "gemini-2.5-flash-preview-tts"; 
 const CHAT_MODEL = "gemini-3-flash-preview"; 
 
-export const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+// Helper: Safely clean JSON string from Markdown code blocks
+const cleanJsonString = (text: string): string => {
+  if (!text) return "{}";
+  // Remove ```json and ``` markers
+  let clean = text.replace(/```json/g, "").replace(/```/g, "").trim();
+  return clean;
+};
 
 const isQuotaError = (error: any): boolean => {
   const msg = error?.message || error?.toString() || "";
   return msg.includes("429") || msg.includes("429") || msg.toLowerCase().includes("quota") || msg.includes("Too Many Requests");
 };
 
+// Helper: Safely get text from response, handling Safety filters which cause .text to throw
+const safeGetText = (response: any): string => {
+  try {
+    // Check if candidates exist
+    if (!response.candidates || response.candidates.length === 0) return "";
+    
+    // Check for safety finish reason
+    const candidate = response.candidates[0];
+    if (candidate.finishReason !== "STOP" && candidate.finishReason !== undefined) {
+      console.warn("AI Response stopped due to:", candidate.finishReason);
+      if (candidate.finishReason === "SAFETY") return ""; 
+    }
+
+    return response.text || "";
+  } catch (e) {
+    console.warn("Could not extract text from response (likely blocked):", e);
+    return "";
+  }
+};
+
 /**
- * Uses Gemini 2.5 Flash Image to generate a white background version,
- * and Gemini Flash to extract structured metadata (Name, Fit, Description).
+ * OPTIMIZED: Uses Promise.all to run background removal and metadata analysis in parallel.
  */
 export const processClothingImage = async (
   base64Image: string, 
   onProgress?: (status: 'processing_image' | 'analyzing') => void
-): Promise<{ processedImage: string, name: string, fit: string, description: string }> => {
+): Promise<{ processedImage: string, name: string, fit: string, description: string, category: string }> => {
   const cleanBase64 = stripBase64Prefix(base64Image);
   
-  // 1. Generate/Edit image to have white background
-  if (onProgress) onProgress('processing_image');
-  
-  let processedImage = base64Image;
-  try {
-    const response = await ai.models.generateContent({
-      model: EDIT_MODEL,
-      contents: {
-        parts: [
-          { inlineData: { mimeType: 'image/png', data: cleanBase64 } },
-          { text: "Generate a professional product shot of this exact clothing item on a pure solid white background. High fidelity. Ensure the item looks isolated.", },
-        ],
-      },
-    });
+  if (onProgress) onProgress('analyzing'); // Update status generic "analyzing/processing"
 
-    for (const part of response.candidates?.[0]?.content?.parts || []) {
-      if (part.inlineData) {
-        processedImage = `data:image/png;base64,${part.inlineData.data}`;
-      }
-    }
-  } catch (error) {
-    console.warn("Image processing skipped:", error);
-    // If it's a quota error, we might still want to proceed with the original image for metadata
-    // unless the user specifically wants to stop. For now, we fallback to original image.
-    if (isQuotaError(error)) {
-       console.warn("Quota exceeded for image generation, using original.");
-    }
-  }
+  // -- 1. Define Promises for Parallel Execution --
 
-  // Artificial delay to be gentle on the API
-  await delay(1000);
-
-  // 2. Get structured data (Name, Fit, Description) using Vision model
-  if (onProgress) onProgress('analyzing');
-
-  let name = "新衣物";
-  let fit = "适中";
-  let description = "一件好看的衣服";
-
-  try {
-    const metadataResponse = await ai.models.generateContent({
-      model: VISION_MODEL,
-      contents: {
-        parts: [
-          { inlineData: { mimeType: 'image/png', data: cleanBase64 } },
-          { text: "分析这件衣物。返回JSON格式数据，包含：name（中文简短名称，如'蓝色牛仔夹克'）、fit（版型，只能是'宽松'、'适中'或'修身'之一）、description（中文简短描述材质风格）。" }
-        ]
-      },
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            name: { type: Type.STRING },
-            fit: { type: Type.STRING, enum: ["宽松", "适中", "修身"] },
-            description: { type: Type.STRING },
+  // Task A: Generate White Background Image
+  const bgRemovalPromise = (async (): Promise<string> => {
+      try {
+        const response = await ai.models.generateContent({
+          model: EDIT_MODEL,
+          contents: {
+            parts: [
+              { inlineData: { mimeType: 'image/png', data: cleanBase64 } },
+              { text: "Generate a professional product shot of this exact clothing item on a pure solid white background. High fidelity. Ensure the item looks isolated.", },
+            ],
+          },
+        });
+        const parts = response.candidates?.[0]?.content?.parts;
+        if (parts && Array.isArray(parts)) {
+          for (const part of parts) {
+            if (part.inlineData) {
+              return `data:image/png;base64,${part.inlineData.data}`;
+            }
           }
         }
+        return base64Image; // Fallback to original
+      } catch (error) {
+        console.warn("Image processing skipped/failed:", error);
+        return base64Image; // Fallback
       }
-    });
+  })();
 
-    const jsonText = metadataResponse.text;
-    if (jsonText) {
-      const data = JSON.parse(jsonText);
-      if (data.name) name = data.name;
-      if (data.fit) fit = data.fit;
-      if (data.description) description = data.description;
-    }
+  // Task B: Extract Metadata (JSON)
+  const metadataPromise = (async (): Promise<{name: string, fit: string, category: string, description: string}> => {
+      let name = "新衣物";
+      let fit = "适中";
+      let category = "未分类";
+      let description = "一件好看的衣服";
 
-  } catch (error) {
-    console.error("Metadata extraction error:", error);
-    if (isQuotaError(error)) {
-        // Critical: Throw error so UI knows to stop and show error message
-        throw new Error("API_QUOTA_EXCEEDED");
-    }
-    // For other errors, we can tolerate defaults
-  }
+      try {
+        const metadataResponse = await ai.models.generateContent({
+          model: VISION_MODEL,
+          contents: {
+            parts: [
+              { inlineData: { mimeType: 'image/png', data: cleanBase64 } },
+              { text: "分析这件衣物。返回JSON格式数据。字段要求：\n1. name: 中文名称，必须极简，**禁止重复堆砌词语**，最多8个字（例如'蓝色条纹领带'）。\n2. category: 类别，如'上装'、'下装'、'鞋靴'、'领带'、'配饰'等。\n3. fit: 版型，只能是'宽松'、'适中'、'修身'、'均码'之一。\n4. description: 中文简短描述材质风格。" }
+            ]
+          },
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                name: { type: Type.STRING },
+                category: { type: Type.STRING },
+                fit: { type: Type.STRING, enum: ["宽松", "适中", "修身", "均码"] },
+                description: { type: Type.STRING },
+              }
+            }
+          }
+        });
 
-  return { processedImage, name, fit, description };
+        const rawText = safeGetText(metadataResponse);
+        const jsonText = cleanJsonString(rawText);
+
+        if (jsonText && jsonText !== "{}") {
+            const data = JSON.parse(jsonText);
+            if (data.name) name = data.name;
+            if (data.fit) fit = data.fit;
+            if (data.category) category = data.category;
+            if (data.description) description = data.description;
+
+            // Post-processing cleanup
+            if (name.length > 20) name = name.substring(0, 12) + "...";
+            if (name.length > 4) {
+                const half = Math.floor(name.length / 2);
+                if (name.substring(0, half) === name.substring(half, half * 2)) {
+                    name = name.substring(0, half);
+                }
+            }
+        }
+      } catch (error) {
+         console.error("Metadata extraction error:", error);
+         if (isQuotaError(error)) throw new Error("API_QUOTA_EXCEEDED");
+      }
+      return { name, fit, category, description };
+  })();
+
+  // -- 2. Await both --
+  const [processedImage, metadata] = await Promise.all([bgRemovalPromise, metadataPromise]);
+
+  return { 
+      processedImage, 
+      name: metadata.name, 
+      fit: metadata.fit, 
+      description: metadata.description, 
+      category: metadata.category 
+  };
 };
 
 export const generateOutfitVisualization = async (
@@ -124,18 +167,35 @@ export const generateOutfitVisualization = async (
     });
 
     const itemDescriptions = items.map(i => `${i.name} (${i.description})`).join(', ');
+    
+    // Updated Prompt: Concise, Structured, Objective.
     const textPrompt = `
-    任务：生成一张逼真的全身穿搭模特图。
-    模特特征：性别/外观符合衣物风格，身材${profile.bodyShape}，身高${profile.height}，体重${profile.weight}，肤色${profile.skinTone}。
-    穿着衣物：${itemDescriptions}
-    要求：高质量全身照，简约背景。同时生成一段中文点评。
+    [IMAGE GENERATION TASK]
+    Generate a realistic full-body photo of a model wearing these items.
+    Model: Handsome Chinese male university student, 185cm, 71kg, Glasses, Textured Fringe Hair, Youthful/Clean vibe.
+    Items: ${itemDescriptions}.
+    Shoes: White Sneakers.
+    Requirements:
+    1. STRICTLY PRESERVE item details (color, pattern, logo).
+    2. Natural fit and lighting.
+    3. Minimalist studio background.
+
+    [TEXT GENERATION TASK]
+    生成一段中文点评。
+    要求：
+    1. **结构清晰**，分三点回答：【视觉效果】、【适用场景】、【色彩分析】。
+    2. **语言简练客观**，不要过度吹捧（禁止使用“完美”、“绝美”、“惊艳”等夸张词汇），点到为止。
+    3. 总字数控制在100字以内。
     `;
     promptParts.push({ text: textPrompt });
 
     try {
         const response = await ai.models.generateContent({
             model: EDIT_MODEL,
-            contents: { parts: promptParts }
+            contents: { parts: promptParts },
+            config: {
+                imageConfig: { aspectRatio: "3:4" }
+            }
         });
 
         let generatedImage = "";
@@ -168,7 +228,7 @@ export const chatWithStylist = async (
   history: any[]
 ) => {
   const wardrobeDesc = wardrobe.map(w => `- ${w.name} (${w.fit}, ID: ${w.id}): ${w.description}`).join('\n');
-  const profileDesc = `用户: ${profile.name}, ${profile.height}, ${profile.weight}, ${profile.skinTone}, ${profile.bodyShape}, 偏好: ${profile.stylePreferences}`;
+  const profileDesc = `用户: 帅气中国男大学生, 185cm, 71kg, 少年感, 戴眼镜, 发型: 微分碎盖, 偏好: ${profile.stylePreferences}`;
 
   const systemInstruction = `你是一位名为 StyleMate 的 AI 造型师。利用衣橱清单和用户档案提供中文穿搭建议。衣橱:${wardrobeDesc}。档案:${profileDesc}`;
 
@@ -185,7 +245,7 @@ export const chatWithStylist = async (
       contents: { parts },
       config: { systemInstruction }
     });
-    return response.text;
+    return safeGetText(response);
   } catch (e) {
     console.error("Chat error", e);
     if (isQuotaError(e)) return "API 配额已用完，请稍后重试。";
@@ -213,14 +273,14 @@ export const generateSpeech = async (text: string): Promise<string | null> => {
 export const suggestOutfits = async (wardrobe: ClothingItem[], profile: UserProfile) => {
     if (wardrobe.length < 2) return "衣橱里的衣服太少啦，多加几件吧！";
     const wardrobeDesc = wardrobe.map(w => `- ${w.name} (${w.fit})`).join('\n');
-    const prompt = `基于用户衣橱: ${wardrobeDesc} 和档案: ${profile.stylePreferences}, ${profile.bodyShape}, ${profile.skinTone}。用中文建议3套穿搭。`;
+    const prompt = `基于用户衣橱: ${wardrobeDesc}。模特为185cm 71kg 帅气中国男大学生，戴眼镜，发型为微分碎盖，气质少年感。用中文建议3套适合校园或约会的穿搭。`;
 
     try {
         const response = await ai.models.generateContent({
             model: CHAT_MODEL,
             contents: { parts: [{ text: prompt }] }
         });
-        return response.text;
+        return safeGetText(response);
     } catch (e) {
         if (isQuotaError(e)) return "API 配额已用完，无法生成建议。";
         return "暂时无法生成建议。";
