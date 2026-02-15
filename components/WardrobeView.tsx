@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Plus, X, Loader2, Shirt, Edit2, UploadCloud, Save, CheckCircle2, Wand2, ImagePlus, AlertCircle } from 'lucide-react';
+import { Plus, X, Loader2, Shirt, Edit2, UploadCloud, Save, CheckCircle2, Wand2, ImagePlus, AlertCircle, RefreshCw } from 'lucide-react';
 import { ClothingItem, Outfit, UserProfile } from '../types';
 import { processClothingImage, generateOutfitVisualization, delay } from '../services/geminiService';
 import { fileToBase64, generateId } from '../utils';
@@ -38,10 +38,8 @@ export const WardrobeView: React.FC<WardrobeViewProps> = ({ wardrobe, setWardrob
   // Effect to process the queue sequentially
   useEffect(() => {
     const processNext = async () => {
-      // If already processing or no items, return
       if (isProcessingQueue) return;
 
-      // Find first pending task
       const nextTask = uploadQueue.find(t => t.status === 'pending');
       if (!nextTask) return;
 
@@ -52,7 +50,7 @@ export const WardrobeView: React.FC<WardrobeViewProps> = ({ wardrobe, setWardrob
         // Important: Add a delay between tasks to avoid API Rate Limit Exceeded
         await delay(2000); 
       } catch (e) {
-        console.error("Queue process error", e);
+        console.error("Queue process logic error", e);
       } finally {
         setIsProcessingQueue(false);
       }
@@ -67,7 +65,6 @@ export const WardrobeView: React.FC<WardrobeViewProps> = ({ wardrobe, setWardrob
     try {
       const base64 = await fileToBase64(task.file);
       
-      // Update status to processing image
       updateTaskStatus(task.id, 'processing_image');
 
       const { processedImage, name, fit, description } = await processClothingImage(
@@ -89,21 +86,35 @@ export const WardrobeView: React.FC<WardrobeViewProps> = ({ wardrobe, setWardrob
       setWardrobe(prev => [newItem, ...prev]);
       updateTaskStatus(task.id, 'complete');
       
-      // Remove from queue after a short delay
+      // Remove from queue after success
       setTimeout(() => {
         setUploadQueue(prev => prev.filter(t => t.id !== task.id));
       }, 2000);
 
-    } catch (error) {
-      console.error(error);
+    } catch (error: any) {
+      console.error("Task failed:", error);
+      let errMsg = "处理失败";
+      
+      if (error.message === "API_QUOTA_EXCEEDED" || error.toString().includes("API_QUOTA_EXCEEDED")) {
+          errMsg = "API 配额不足";
+      }
+
       setUploadQueue(prev => prev.map(t => 
-        t.id === task.id ? { ...t, status: 'error', errorMessage: '配额超限或失败' } : t
+        t.id === task.id ? { ...t, status: 'error', errorMessage: errMsg } : t
       ));
     }
   };
 
   const updateTaskStatus = (id: string, status: UploadTask['status']) => {
     setUploadQueue(prev => prev.map(t => t.id === id ? { ...t, status } : t));
+  };
+
+  const retryTask = (id: string) => {
+      setUploadQueue(prev => prev.map(t => t.id === id ? { ...t, status: 'pending', errorMessage: undefined } : t));
+  };
+
+  const removeTask = (id: string) => {
+      setUploadQueue(prev => prev.filter(t => t.id !== id));
   };
 
   const handleFiles = async (files: FileList | null) => {
@@ -126,7 +137,6 @@ export const WardrobeView: React.FC<WardrobeViewProps> = ({ wardrobe, setWardrob
       newTasks.push(task);
     }
 
-    // Add to queue. The useEffect will pick them up automatically.
     setUploadQueue(prev => [...prev, ...newTasks]);
 
     if (fileInputRef.current) fileInputRef.current.value = '';
@@ -153,10 +163,9 @@ export const WardrobeView: React.FC<WardrobeViewProps> = ({ wardrobe, setWardrob
   };
 
   const deleteItem = (e: React.MouseEvent, id: string) => {
-    e.stopPropagation(); // Stop event bubbling to card click
+    e.stopPropagation(); 
     if (window.confirm("确定要删除这件衣物吗？")) {
         setWardrobe(prev => prev.filter(item => item.id !== id));
-        // Also remove from selection if selected
         if (selectedIds.has(id)) {
             const newSet = new Set(selectedIds);
             newSet.delete(id);
@@ -189,7 +198,6 @@ export const WardrobeView: React.FC<WardrobeViewProps> = ({ wardrobe, setWardrob
       const selectedItems = wardrobe.filter(item => selectedIds.has(item.id));
 
       try {
-          // Call Gemini to generate outfit visualization
           const { image, description } = await generateOutfitVisualization(selectedItems, profile);
 
           const newOutfit: Outfit = {
@@ -201,26 +209,30 @@ export const WardrobeView: React.FC<WardrobeViewProps> = ({ wardrobe, setWardrob
           };
 
           addOutfit(newOutfit);
-          setSelectedIds(new Set()); // Clear selection
+          setSelectedIds(new Set()); 
           if(window.confirm("穿搭生成成功！是否前往穿搭页面查看？")) {
               goToOutfits();
           }
 
-      } catch (e) {
+      } catch (e: any) {
           console.error(e);
-          alert("生成穿搭失败（可能是API配额超限，请稍后再试）。");
+          if (e.message === "API_QUOTA_EXCEEDED" || e.toString().includes("API_QUOTA_EXCEEDED")) {
+              alert("API 配额不足，无法生成穿搭。请稍后再试。");
+          } else {
+              alert("生成穿搭失败，请重试。");
+          }
       } finally {
           setIsGeneratingOutfit(false);
       }
   };
 
-  const getStatusText = (status: UploadTask['status']) => {
-      switch (status) {
+  const getStatusText = (task: UploadTask) => {
+      if (task.errorMessage) return task.errorMessage;
+      switch (task.status) {
           case 'pending': return '等待处理...';
           case 'processing_image': return '正在去除背景...';
           case 'analyzing': return '正在分析款式...';
           case 'complete': return '完成！';
-          case 'error': return '失败/配额超限';
           default: return '处理中...';
       }
   };
@@ -283,7 +295,7 @@ export const WardrobeView: React.FC<WardrobeViewProps> = ({ wardrobe, setWardrob
           ref={fileInputRef} 
           className="hidden" 
           accept="image/*"
-          multiple // Allow multiple files
+          multiple 
           onChange={handleFileUpload}
         />
       </div>
@@ -292,19 +304,29 @@ export const WardrobeView: React.FC<WardrobeViewProps> = ({ wardrobe, setWardrob
       {uploadQueue.length > 0 && (
           <div className="mb-6 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
               {uploadQueue.map(task => (
-                  <div key={task.id} className="bg-white p-3 rounded-lg border border-slate-100 shadow-sm flex items-center gap-3 animate-in slide-in-from-top-2">
-                      <div className="w-12 h-12 rounded bg-slate-100 flex-shrink-0 overflow-hidden">
+                  <div key={task.id} className={`bg-white p-3 rounded-lg border shadow-sm flex items-center gap-3 animate-in slide-in-from-top-2 ${task.status === 'error' ? 'border-red-200 bg-red-50' : 'border-slate-100'}`}>
+                      <div className="w-12 h-12 rounded bg-slate-100 flex-shrink-0 overflow-hidden relative group">
                           <img src={task.preview} alt="uploading" className="w-full h-full object-cover" />
+                          {task.status === 'error' && (
+                              <button onClick={() => removeTask(task.id)} className="absolute inset-0 bg-black/50 flex items-center justify-center text-white opacity-0 group-hover:opacity-100 transition">
+                                  <X className="w-4 h-4" />
+                              </button>
+                          )}
                       </div>
                       <div className="flex-1 min-w-0">
                           <p className="text-sm font-medium text-slate-800 truncate">{task.file.name}</p>
-                          <p className={`text-xs flex items-center gap-1 ${task.status === 'error' ? 'text-red-500' : task.status === 'complete' ? 'text-green-600' : task.status === 'pending' ? 'text-slate-400' : 'text-indigo-600'}`}>
+                          <p className={`text-xs flex items-center gap-1 ${task.status === 'error' ? 'text-red-600 font-bold' : task.status === 'complete' ? 'text-green-600' : task.status === 'pending' ? 'text-slate-400' : 'text-indigo-600'}`}>
                               {task.status === 'complete' && <CheckCircle2 className="w-3 h-3" />}
                               {task.status === 'error' && <AlertCircle className="w-3 h-3" />}
                               {(task.status === 'processing_image' || task.status === 'analyzing') && <Loader2 className="w-3 h-3 animate-spin" />}
-                              {getStatusText(task.status)}
+                              {getStatusText(task)}
                           </p>
                       </div>
+                      {task.status === 'error' && (
+                          <button onClick={() => retryTask(task.id)} className="p-1.5 text-indigo-600 hover:bg-indigo-100 rounded-full" title="重试">
+                              <RefreshCw className="w-4 h-4" />
+                          </button>
+                      )}
                   </div>
               ))}
           </div>
