@@ -1,0 +1,8 @@
+{
+  "name": "StyleMate AI",
+  "description": "您的个人AI造型师和衣橱管家。数字化您的衣橱，获取个性化穿搭建议，与AI时尚专家畅聊。",
+  "requestFramePermissions": [
+    "microphone",
+    "camera"
+  ]
+}
